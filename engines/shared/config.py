@@ -16,6 +16,10 @@ else:
 
 
 def _resolve_database_url() -> str:
+    raw_url = os.getenv("DATABASE_URL", "").strip()
+    if raw_url and "YOUR_POSTGRES_PASSWORD" not in raw_url:
+        return raw_url
+
     user = quote_plus(os.getenv("POSTGRES_USER", "prepfreex_user"))
     password = quote_plus(os.getenv("POSTGRES_PASSWORD", ""))
     host = os.getenv("POSTGRES_HOST", "127.0.0.1")
@@ -23,10 +27,6 @@ def _resolve_database_url() -> str:
     db = os.getenv("POSTGRES_DB", "prepfreex")
     if password:
         return f"postgresql://{user}:{password}@{host}:{port}/{db}"
-
-    raw_url = os.getenv("DATABASE_URL", "").strip()
-    if raw_url and "YOUR_POSTGRES_PASSWORD" not in raw_url:
-        return raw_url
 
     return f"postgresql://{user}@{host}:{port}/{db}"
 
@@ -86,7 +86,7 @@ class Settings:
     inventory_dir: Path = Path(os.getenv("INVENTORY_DIR", "data/inventory"))
     taxonomy_version: str = os.getenv("TAXONOMY_VERSION", "jee_main_2027")
 
-    # Object Storage Configuration (Local, MinIO AIStor, AWS S3)
+    # Object Storage Configuration (Local, MinIO AIStor, Neon Object Storage, AWS S3)
     object_storage_backend: str = os.getenv("OBJECT_STORAGE_BACKEND", "local").lower()
     minio_endpoint: str = os.getenv("MINIO_ENDPOINT", "http://127.0.0.1:9000")
     minio_bucket: str = os.getenv("MINIO_BUCKET", "prepfreex-question-assets")
@@ -97,6 +97,9 @@ class Settings:
     minio_data_dir: Path = Path(os.getenv("MINIO_DATA_DIR", "C:/PrepFreeX/minio-data"))
     aws_s3_bucket: str = os.getenv("AWS_S3_BUCKET", "prepfreex-question-assets-prod")
     aws_default_region: str = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+    neon_endpoint_url_s3: str = os.getenv("AWS_ENDPOINT_URL_S3", "")
+    neon_storage_bucket: str = os.getenv("NEON_STORAGE_BUCKET", "assets")
+    neon_region: str = os.getenv("AWS_REGION", "ap-southeast-1")
 
 
 settings = Settings()

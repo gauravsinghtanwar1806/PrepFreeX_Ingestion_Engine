@@ -52,3 +52,5 @@ minio-data/
 *.meta.json
 
 scratch/
+.neon
+node_modules/

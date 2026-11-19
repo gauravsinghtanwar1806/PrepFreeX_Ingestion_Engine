@@ -373,6 +373,15 @@ def get_storage(provider: str | None = None, root_dir: Path | str | None = None)
             use_ssl=settings.minio_use_ssl,
             addressing_style="path",
         )
+    elif target_provider in {"neon", "neon_s3", "neon_object_storage", "object_storage"}:
+        return S3ObjectStorage(
+            endpoint_url=settings.neon_endpoint_url_s3 or os.getenv("AWS_ENDPOINT_URL_S3"),
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            region_name=settings.neon_region or os.getenv("AWS_REGION", "ap-southeast-1"),
+            use_ssl=True,
+            addressing_style="path",  # Path-style addressing required by Neon
+        )
     elif target_provider in {"aws_s3", "s3", "r2"}:
         return S3ObjectStorage(
             endpoint_url=None,  # Standard AWS S3 endpoint
@@ -382,5 +391,5 @@ def get_storage(provider: str | None = None, root_dir: Path | str | None = None)
             use_ssl=True,
             addressing_style="auto",
         )
-    raise ValueError(f"Unknown storage provider: {target_provider} (supported: local, minio, aws_s3)")
+    raise ValueError(f"Unknown storage provider: {target_provider} (supported: local, minio, neon, aws_s3)")
 

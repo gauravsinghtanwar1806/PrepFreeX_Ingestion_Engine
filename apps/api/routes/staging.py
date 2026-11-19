@@ -6,8 +6,8 @@ Allows inspecting, approving, rejecting, and promoting staged questions from the
 from __future__ import annotations
 import json
 import uuid
-from typing import Optional
-from fastapi import APIRouter, HTTPException, Query
+from typing import Optional, Any, List
+from fastapi import APIRouter, HTTPException, Query, Body
 from pydantic import BaseModel
 from apps.api.db import get_db_cursor
 from engines.ingestion.safe_ingestor import SafeIngestionPipeline
@@ -27,6 +27,18 @@ class IngestNextRequest(BaseModel):
     pdf_path: Optional[str] = None
     max_pages: Optional[int] = 2
     no_solver: bool = False
+
+class EditDatabaseQuestionRequest(BaseModel):
+    question_text_latex: Optional[str] = None
+    options: Optional[list[Any]] = None
+    correct_option: Optional[str] = None
+    numerical_target: Optional[float] = None
+    solution_text_latex: Optional[str] = None
+    subject: Optional[str] = None
+    unit_code: Optional[str] = None
+    chapter_name: Optional[str] = None
+
+EditDatabaseQuestionRequest.model_rebuild()
 
 @router.get("/summary")
 def get_staging_summary():
@@ -309,4 +321,237 @@ def promote_approved_to_production():
         "promoted_count": promoted_count,
         "message": f"Successfully promoted {promoted_count} verified questions into active student question bank!"
     }
+
+@router.get("/database-taxonomy")
+def get_database_taxonomy(subject: Optional[str] = None):
+    """
+    Returns hierarchical units and subtopics present in completed_questions
+    with question counts.
+    """
+    base_where = "WHERE cq.assessment_status = 'ELIGIBLE'"
+    params = []
+    if subject and subject.upper() != "ALL":
+        base_where += " AND cq.subject = %s"
+        params.append(subject.upper())
+
+    with get_db_cursor() as cur:
+        cur.execute(f"""
+            SELECT 
+                cq.subject,
+                cq.unit_code,
+                COALESCE(u.unit_title, cq.chapter_name) as unit_title,
+                cq.primary_topic_code,
+                COALESCE(t.topic_name, cq.primary_topic_code) as topic_name,
+                count(*) as q_count
+            FROM public.completed_questions cq
+            LEFT JOIN public.syllabus_units u ON cq.unit_code = u.unit_code
+            LEFT JOIN public.chapter_topics t ON cq.primary_topic_code = t.topic_code
+            {base_where}
+            GROUP BY cq.subject, cq.unit_code, u.unit_title, cq.chapter_name, cq.primary_topic_code, t.topic_name
+            ORDER BY cq.subject, cq.unit_code, cq.primary_topic_code;
+        """, tuple(params))
+        rows = cur.fetchall()
+
+    units_map = {}
+    for r in rows:
+        u_code = r["unit_code"] or "OTHER"
+        if u_code not in units_map:
+            units_map[u_code] = {
+                "unit_code": u_code,
+                "unit_title": r["unit_title"] or u_code,
+                "subject": r["subject"],
+                "total_questions": 0,
+                "topics": []
+            }
+        units_map[u_code]["total_questions"] += r["q_count"]
+        if r["primary_topic_code"]:
+            units_map[u_code]["topics"].append({
+                "topic_code": r["primary_topic_code"],
+                "topic_name": r["topic_name"] or r["primary_topic_code"],
+                "q_count": r["q_count"]
+            })
+
+    return {
+        "units": list(units_map.values())
+    }
+
+@router.get("/database-questions")
+def list_database_questions(
+    subject: Optional[str] = Query(None),
+    unit_code: Optional[str] = Query(None),
+    topic_code: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    verified_status: Optional[str] = Query("UNVERIFIED"),
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0)
+):
+    """
+    Fetches live questions from public.completed_questions for interactive test review and manual pruning.
+    Enforces assessment_status = 'ELIGIBLE'.
+    By default filters to UNVERIFIED questions so verified questions are hidden from the review test queue.
+    """
+    base_where = "WHERE assessment_status = 'ELIGIBLE'"
+    params = []
+
+    if verified_status == "UNVERIFIED":
+        base_where += " AND (academic_status != 'HUMAN_VERIFIED' OR academic_status IS NULL)"
+    elif verified_status == "VERIFIED":
+        base_where += " AND academic_status = 'HUMAN_VERIFIED'"
+
+    if subject and subject.upper() != "ALL":
+        base_where += " AND subject = %s"
+        params.append(subject.upper())
+    if unit_code and unit_code.upper() != "ALL":
+        base_where += " AND unit_code = %s"
+        params.append(unit_code.upper())
+    if topic_code and topic_code.upper() != "ALL":
+        base_where += " AND primary_topic_code = %s"
+        params.append(topic_code.upper())
+    if search:
+        base_where += " AND (question_text_latex ILIKE %s OR question_uid ILIKE %s OR chapter_name ILIKE %s)"
+        params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+
+    with get_db_cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM public.completed_questions {base_where};", tuple(params))
+        total_count = cur.fetchone()["count"]
+
+        # Also get unverified vs verified counts for top-level counters
+        cur.execute("""
+            SELECT 
+                COUNT(*) FILTER (WHERE assessment_status = 'ELIGIBLE' AND (academic_status != 'HUMAN_VERIFIED' OR academic_status IS NULL)) as unverified,
+                COUNT(*) FILTER (WHERE assessment_status = 'ELIGIBLE' AND academic_status = 'HUMAN_VERIFIED') as verified,
+                COUNT(*) FILTER (WHERE assessment_status = 'ELIGIBLE') as total
+            FROM public.completed_questions;
+        """)
+        counts_row = cur.fetchone()
+
+        query = f"""
+            SELECT id, question_uid, subject, unit_code, chapter_name, primary_topic_code,
+                   question_type, question_text_latex, options, correct_option, numerical_target,
+                   solution_text_latex, has_diagram, diagram_s3_key, difficulty_tier, source_pdf,
+                   academic_status
+            FROM public.completed_questions
+            {base_where}
+            ORDER BY id ASC
+            LIMIT %s OFFSET %s;
+        """
+        cur.execute(query, tuple(params + [limit, offset]))
+        rows = cur.fetchall()
+
+    return {
+        "total": total_count,
+        "counts": counts_row,
+        "limit": limit,
+        "offset": offset,
+        "questions": rows
+    }
+
+@router.post("/database-questions/{question_uid}/verify")
+def verify_database_question(question_uid: str):
+    """
+    Marks a database question as HUMAN_VERIFIED.
+    Immediately removes it from the unverified review queue.
+    """
+    with get_db_cursor() as cur:
+        cur.execute("""
+            UPDATE public.completed_questions
+            SET academic_status = 'HUMAN_VERIFIED',
+                answer_status = 'HUMAN_VERIFIED'
+            WHERE question_uid = %s
+            RETURNING id, question_uid, subject, chapter_name, academic_status;
+        """, (question_uid,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Question not found in database.")
+
+    return {
+        "status": "SUCCESS",
+        "message": f"Question {question_uid} marked as HUMAN_VERIFIED!",
+        "question": row
+    }
+
+@router.patch("/database-questions/{question_uid}")
+def edit_database_question(question_uid: str, req: dict = Body(...)):
+    """
+    Edits a database question's stem, options, correct option, or solution directly.
+    Automatically marks the updated question as HUMAN_VERIFIED.
+    """
+    updates = []
+    params = []
+    if req.get("question_text_latex") is not None:
+        updates.append("question_text_latex = %s")
+        params.append(req["question_text_latex"])
+    if req.get("options") is not None:
+        updates.append("options = %s")
+        params.append(json.dumps(req["options"]) if not isinstance(req["options"], str) else req["options"])
+    if req.get("correct_option") is not None:
+        updates.append("correct_option = %s")
+        params.append(str(req["correct_option"]).strip().upper())
+    if req.get("numerical_target") is not None:
+        updates.append("numerical_target = %s")
+        params.append(req["numerical_target"])
+    if req.get("solution_text_latex") is not None:
+        updates.append("solution_text_latex = %s")
+        params.append(req["solution_text_latex"])
+    if req.get("subject") is not None:
+        updates.append("subject = %s")
+        params.append(str(req["subject"]).strip().upper())
+    if req.get("unit_code") is not None:
+        updates.append("unit_code = %s")
+        params.append(str(req["unit_code"]).strip().upper())
+    if req.get("chapter_name") is not None:
+        updates.append("chapter_name = %s")
+        params.append(str(req["chapter_name"]).strip())
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields provided for update.")
+
+    updates.append("academic_status = 'HUMAN_VERIFIED'")
+    params.append(question_uid)
+    set_clause = ", ".join(updates)
+
+    with get_db_cursor() as cur:
+        cur.execute(f"""
+            UPDATE public.completed_questions
+            SET {set_clause}
+            WHERE question_uid = %s
+            RETURNING id, question_uid, subject, unit_code, chapter_name, primary_topic_code,
+                      question_type, question_text_latex, options, correct_option, numerical_target,
+                      solution_text_latex, has_diagram, diagram_s3_key, difficulty_tier, source_pdf,
+                      academic_status;
+        """, tuple(params))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Question not found in database.")
+
+    return {
+        "status": "SUCCESS",
+        "message": f"Question {question_uid} successfully updated and marked as HUMAN_VERIFIED!",
+        "question": row
+    }
+
+@router.delete("/database-questions/{question_uid}")
+def remove_database_question(question_uid: str):
+    """
+    Removes a bad or defective question from the live database pool by quarantining it.
+    Immediately excludes it from all tests, assessments, and public queries.
+    """
+    with get_db_cursor() as cur:
+        cur.execute("""
+            UPDATE public.completed_questions
+            SET assessment_status = 'QUARANTINED',
+                academic_status = 'QUARANTINED_BY_REVIEWER'
+            WHERE question_uid = %s
+            RETURNING id, question_uid, subject, chapter_name;
+        """, (question_uid,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Question not found in database.")
+
+    return {
+        "status": "SUCCESS",
+        "message": f"Successfully removed question {question_uid} from active database!",
+        "removed_question": row
+    }
+
 
